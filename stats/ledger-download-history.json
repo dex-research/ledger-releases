@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "snapshots": [
+    {
+      "day": "2026-09-28",
+      "checkedAt": "2026-09-28T22:42:26Z",
+      "total": 9,
+      "releases": [
+        {
+          "id": 398455489,
+          "version": "v0.5.1",
+          "publishedAt": "2026-09-28T17:49:35Z",
+          "downloads": 5,
+          "assets": [
+            {
+              "id": 595942160,
+              "name": "Ledger-0.5.1-x64-Setup.exe",
+              "downloads": 4
+            },
+            {
+              "id": 595943036,
+              "name": "Ledger-Windows-Setup.exe",
+              "downloads": 1
+            }
+          ]
+        },
+        {
+          "id": 398215807,
+          "version": "v0.5.0",
+          "publishedAt": "2026-09-28T12:13:23Z",
+          "downloads": 4,
+          "assets": [
+            {
+              "id": 595330270,
+              "name": "Ledger-0.5.0-x64-Setup.exe",
+              "downloads": 2
+            },
+            {
+              "id": 595331062,
+              "name": "Ledger-Windows-Setup.exe",
+              "downloads": 2
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
