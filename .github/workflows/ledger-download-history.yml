@@ -1,0 +1,218 @@
+name: Record Ledger download history
+
+on:
+  schedule:
+    - cron: '53 23 * * *'
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [.github/workflows/ledger-download-history.yml]
+
+permissions: {}
+
+concurrency:
+  group: ledger-download-history
+  cancel-in-progress: false
+
+jobs:
+  snapshot:
+    if: github.repository == 'dex-research/ledger-releases'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Collect published installer counts
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import base64
+          import datetime as dt
+          import json
+          import os
+          import re
+          import sys
+          import urllib.error
+          import urllib.request
+
+          REPOSITORY = "dex-research/ledger-releases"
+          HISTORY_PATH = "stats/ledger-download-history.json"
+          INSTALLER = re.compile(r"^Ledger-.+-Setup\.exe$")
+          UTC = dt.timezone.utc
+
+          def require(condition, message):
+              if not condition:
+                  raise ValueError(message)
+
+          def integer(value, positive=False):
+              return type(value) is int and value >= (1 if positive else 0)
+
+          def timestamp(value):
+              require(isinstance(value, str) and value.endswith("Z"), "Invalid UTC timestamp")
+              try:
+                  parsed = dt.datetime.fromisoformat(value[:-1] + "+00:00")
+              except (TypeError, ValueError):
+                  raise ValueError("Invalid UTC timestamp") from None
+              require(parsed.tzinfo is not None, "Invalid UTC timestamp")
+              return parsed
+
+          def api(path, *, data=None, missing_ok=False, accept="application/vnd.github+json"):
+              request = urllib.request.Request(
+                  "https://api.github.com" + path,
+                  data=None if data is None else json.dumps(data).encode("utf-8"),
+                  headers={
+                      "Accept": accept,
+                      "Authorization": "Bearer " + os.environ["GITHUB_TOKEN"],
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "User-Agent": "ledger-download-history",
+                      "Content-Type": "application/json",
+                  },
+                  method="GET" if data is None else "PUT",
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=20) as response:
+                      return json.load(response)
+              except urllib.error.HTTPError as error:
+                  if missing_ok and error.code == 404:
+                      return None
+                  raise ValueError("GitHub API request failed (HTTP %s)" % error.code) from None
+              except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+                  raise ValueError("GitHub API request failed") from None
+
+          def pages(path):
+              collected = []
+              for page in range(1, 11):
+                  rows = api(path + "?per_page=100&page=" + str(page))
+                  require(isinstance(rows, list) and len(rows) <= 100, "Invalid paginated response")
+                  require(all(isinstance(row, dict) for row in rows), "Invalid paginated record")
+                  collected.extend(rows)
+                  if len(rows) < 100:
+                      return collected
+              raise ValueError("Pagination exceeded the safe limit; history was not changed")
+
+          def validate_snapshot(snapshot):
+              require(isinstance(snapshot, dict), "Invalid history snapshot")
+              day = snapshot.get("day")
+              require(isinstance(day, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", day), "Invalid history date")
+              require(timestamp(snapshot.get("checkedAt")).date().isoformat() == day, "History date does not match its timestamp")
+              require(integer(snapshot.get("total")), "Invalid historical total")
+              releases = snapshot.get("releases")
+              require(isinstance(releases, list), "Invalid historical releases")
+              release_ids, asset_ids = set(), set()
+              for release in releases:
+                  require(isinstance(release, dict), "Invalid historical release")
+                  release_id = release.get("id")
+                  require(integer(release_id, True) and release_id not in release_ids, "Invalid historical release ID")
+                  release_ids.add(release_id)
+                  require(isinstance(release.get("version"), str) and bool(release["version"]), "Invalid historical version")
+                  timestamp(release.get("publishedAt"))
+                  require(integer(release.get("downloads")), "Invalid historical release count")
+                  assets = release.get("assets")
+                  require(isinstance(assets, list) and bool(assets), "Invalid historical assets")
+                  for asset in assets:
+                      require(isinstance(asset, dict), "Invalid historical asset")
+                      asset_id = asset.get("id")
+                      require(integer(asset_id, True) and asset_id not in asset_ids, "Invalid historical asset ID")
+                      asset_ids.add(asset_id)
+                      require(isinstance(asset.get("name"), str) and INSTALLER.fullmatch(asset["name"]), "Invalid historical installer")
+                      require(integer(asset.get("downloads")), "Invalid historical asset count")
+                  require(release["downloads"] == sum(asset["downloads"] for asset in assets), "Historical release count mismatch")
+              require(snapshot["total"] == sum(release["downloads"] for release in releases), "Historical total mismatch")
+
+          def main():
+              require(os.environ.get("GITHUB_REPOSITORY") == REPOSITORY, "Unexpected repository")
+              require(bool(os.environ.get("GITHUB_TOKEN")), "Missing workflow token")
+              repository_path = "/repos/" + REPOSITORY
+              current_releases = []
+              seen_release_ids, seen_asset_ids = set(), set()
+              for release in pages(repository_path + "/releases"):
+                  require(type(release.get("draft")) is bool and type(release.get("prerelease")) is bool, "Invalid release status")
+                  if release["draft"] or release["prerelease"]:
+                      continue
+                  release_id = release.get("id")
+                  require(integer(release_id, True) and release_id not in seen_release_ids, "Invalid release ID")
+                  seen_release_ids.add(release_id)
+                  require(isinstance(release.get("tag_name"), str) and bool(release["tag_name"]), "Invalid release version")
+                  timestamp(release.get("published_at"))
+                  installers = []
+                  for asset in pages(repository_path + "/releases/" + str(release_id) + "/assets"):
+                      require(isinstance(asset.get("state"), str) and isinstance(asset.get("name"), str), "Invalid asset status or name")
+                      if asset["state"] != "uploaded" or not INSTALLER.fullmatch(asset["name"]):
+                          continue
+                      asset_id = asset.get("id")
+                      require(integer(asset_id, True) and asset_id not in seen_asset_ids, "Invalid asset ID")
+                      require(integer(asset.get("download_count")), "Invalid asset download count")
+                      seen_asset_ids.add(asset_id)
+                      installers.append({"id": asset_id, "name": asset["name"], "downloads": asset["download_count"]})
+                  if installers:
+                      installers.sort(key=lambda asset: asset["id"])
+                      current_releases.append({
+                          "id": release_id,
+                          "version": release["tag_name"],
+                          "publishedAt": release["published_at"],
+                          "downloads": sum(asset["downloads"] for asset in installers),
+                          "assets": installers,
+                      })
+              current_releases.sort(key=lambda release: (release["publishedAt"], release["id"]), reverse=True)
+              checked_at = dt.datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+              snapshot = {
+                  "day": checked_at[:10],
+                  "checkedAt": checked_at,
+                  "total": sum(release["downloads"] for release in current_releases),
+                  "releases": current_releases,
+              }
+              validate_snapshot(snapshot)
+
+              content_path = repository_path + "/contents/" + HISTORY_PATH
+              existing = api(content_path + "?ref=main", missing_ok=True, accept="application/vnd.github.object+json")
+              previous = []
+              sha = None
+              if existing is not None:
+                  require(isinstance(existing, dict) and existing.get("type") == "file", "Invalid history file response")
+                  sha = existing.get("sha")
+                  require(isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40,64}", sha), "Invalid history file SHA")
+                  if existing.get("encoding") == "none":
+                      # GitHub omits inline content for files larger than 1 MB.
+                      history = api(content_path + "?ref=main", accept="application/vnd.github.raw+json")
+                  else:
+                      require(existing.get("encoding") == "base64" and isinstance(existing.get("content"), str), "Invalid history file encoding")
+                      try:
+                          raw = base64.b64decode("".join(existing["content"].split()), validate=True)
+                          history = json.loads(raw.decode("utf-8"))
+                      except (ValueError, UnicodeError):
+                          raise ValueError("Cannot decode existing history; history was not changed") from None
+                  require(isinstance(history, dict) and type(history.get("schemaVersion")) is int and history["schemaVersion"] == 1, "Unsupported history schema")
+                  previous = history.get("snapshots")
+                  require(isinstance(previous, list), "Invalid history snapshots")
+                  seen_days = set()
+                  for record in previous:
+                      validate_snapshot(record)
+                      require(record["day"] not in seen_days and record["day"] <= snapshot["day"], "Duplicate or future history date")
+                      seen_days.add(record["day"])
+
+              snapshots = [record for record in previous if record["day"] != snapshot["day"]]
+              snapshots.append(snapshot)
+              snapshots.sort(key=lambda record: record["day"])
+              snapshots = snapshots[-3650:]
+              content = json.dumps({"schemaVersion": 1, "snapshots": snapshots}, indent=2, ensure_ascii=False) + "\n"
+              update = {
+                  "message": "Record Ledger download snapshot for " + snapshot["day"],
+                  "branch": "main",
+                  "content": base64.b64encode(content.encode("utf-8")).decode("ascii"),
+              }
+              if sha is not None:
+                  update["sha"] = sha
+              api(content_path, data=update)
+              print("Saved %s daily snapshots." % len(snapshots))
+
+          if __name__ == "__main__":
+              try:
+                  main()
+              except Exception as error:
+                  # Do not log HTTP bodies, request headers, environment values, or tokens.
+                  message = str(error) if isinstance(error, ValueError) else "Snapshot failed; history was not changed"
+                  print(message, file=sys.stderr)
+                  sys.exit(1)
+          PY
